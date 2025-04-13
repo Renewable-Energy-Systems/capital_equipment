@@ -28,7 +28,7 @@ if not openai.api_key:
     raise RuntimeError("OPENAI_API_KEY not set")
 
 # ── CONFIG ─────────────────────────────────────────────────
-EXCEL_PATH   = pathlib.Path("data/data_cp_1.xlsx")
+EXCEL_PATH   = pathlib.Path("C:/Users/PRANAY-RES/OneDrive - Renewable Energy Systems Limited/RES/Capital Equipment 2025/Capital_Equipment.xlsx")
 TEMPLATE_HDR = pathlib.Path("templates/u1.docx")
 OUT_ROOT     = pathlib.Path("C:/Users/PRANAY-RES/OneDrive - Renewable Energy Systems Limited/RES/Capital Equipment 2025")           # top‑level output dir
 MODEL        = "gpt-4o-mini"                # or gpt-4o
@@ -36,7 +36,7 @@ TEMPERATURE  = 0.2
 OUT_ROOT.mkdir(exist_ok=True)
 
 # ── 1. Load Excel ──────────────────────────────────────────
-raw = pd.read_excel(EXCEL_PATH, header=2).iloc[1:]
+raw = pd.read_excel(EXCEL_PATH, sheet_name="cp_list", header=2).iloc[1:]
 raw = raw.rename(columns={
     "Unnamed: 1": "cid",
     "Unnamed: 2": "Item",
