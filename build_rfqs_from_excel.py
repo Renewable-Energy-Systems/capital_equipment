@@ -1,16 +1,16 @@
-
 """
-build_rfqs_from_excel.py – v2.2
-Adds support for an optional **Description** column in data_cp_1.xlsx.
-If present and non‑blank, the description text is fed to GPT and explicitly
-inserted as extra bullet points in the Technical Requirements section.
-
-Formatting fixes (no stray bold) remain intact.
+build_rfqs_from_excel.py – formatting & richer‑spec release
+===========================================================
+• Removes underlines in table body
+• Distinct font sizes: headings 14 pt, table header 12 pt, body 11 pt
+• GPT asked for ≥8 tech parameters
+• Safe border handling (no '{http' crash)
 """
 
 from __future__ import annotations
-import os, json, textwrap, pathlib
-from typing import Tuple, List
+import os, json, pathlib, textwrap
+from typing import List
+
 import pandas as pd
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -18,128 +18,150 @@ import openai
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml import parse_xml
+from docx.oxml.ns import qn, nsdecls
 
-# ── ENV / API KEY ────────────────────────────────────────────
+# ── ENV / KEY ───────────────────────────────────────────────
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+openai.api_key = os.getenv("OPENAI_API_KEY") or ""
 if not openai.api_key:
-    raise RuntimeError("OPENAI_API_KEY not set (env var or .env file)")
+    raise RuntimeError("OPENAI_API_KEY not set")
 
-# ── CONFIG ───────────────────────────────────────────────────
+# ── CONFIG ─────────────────────────────────────────────────
 EXCEL_PATH   = pathlib.Path("data/data_cp_1.xlsx")
 TEMPLATE_HDR = pathlib.Path("templates/u1.docx")
 OUT_DIR      = pathlib.Path("out/rfq_docs")
-MODEL        = "gpt-4o-mini"
+MODEL        = "gpt-4o-mini"     # or "gpt-4o"
 TEMPERATURE  = 0.2
-
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── 1. LOAD LIST ─────────────────────────────────────────────
-raw_df = pd.read_excel(EXCEL_PATH, header=2).iloc[1:]
-col_map = {
-    "Unnamed: 1": "cid",
-    "Unnamed: 2": "Item",
-    "Unnamed: 3": "Priority",
-    "Unnamed: 4": "Assignee",
-    "Unnamed: 5": "Description",  # may or may not exist
-}
-for k, v in col_map.items():
-    if k in raw_df.columns:
-        raw_df = raw_df.rename(columns={k: v})
-df = (raw_df
-      .loc[:, [c for c in ["cid","Item","Priority","Assignee","Description"] if c in raw_df.columns]]
-      .dropna(subset=["Item"])
-      .reset_index(drop=True))
+# ── 1. Load Excel ──────────────────────────────────────────
+raw = pd.read_excel(EXCEL_PATH, header=2).iloc[1:]
+raw = raw.rename(columns={
+    "Unnamed: 1":"cid","Unnamed: 2":"Item","Unnamed: 3":"Priority",
+    "Unnamed: 4":"Assignee","Unnamed: 5":"Description"})
+df = (raw[["cid","Item","Priority","Assignee","Description"]]
+      .dropna(subset=["Item"]).reset_index(drop=True))
 
-# ── 2. GPT PROMPTS ───────────────────────────────────────────
-SYSTEM_PROMPT = textwrap.dedent("""You are a senior procurement engineer at Renewable Energy Systems Limited,
-a defence lithium‑thermal battery manufacturer (AS9100D). Draft RFQ sections
-with measurable specifications aligned to MIL‑STD / ASTM / IEC standards.
+# ── 2. GPT prompts ─────────────────────────────────────────
+SYSTEM = textwrap.dedent("""\
+You are a senior procurement engineer at Renewable Energy Systems Limited
+(lithium‑thermal battery manufacturer, AS9100D). Draft concise RFQ sections
+aligned to MIL‑STD‑810H, MIL‑STD‑1580, ASTM, IEC, etc.
 
-Return JSON with keys:
-  introduction, scope, tech_table(list[{parameter,requirement}]),
-  commercial_terms(list[str]), docs_required(list[str]).
+Return **valid JSON only**:
+  introduction, scope, tech_table, commercial_terms, docs_required
+tech_table must contain **at least 8** {parameter, requirement} pairs that are
+truly relevant to the equipment.
 """)
 
-USER_TEMPLATE = (
-    "Draft RFQ sections for capital equipment '{name}'. "
-    "{desc_clause}"
-    "Use lowercase keys 'parameter' and 'requirement' in tech_table."
-)
+USER_TMPL = ("Draft the RFQ sections for equipment '{item}'. "
+             "{desc_clause}"
+             "Return JSON only.")
 
-def draft_sections(name:str, desc:str|None)->dict:
-    desc_clause = f"Include these user‑specified criteria: {desc}. " if desc else ""
-    user_prompt = USER_TEMPLATE.format(name=name, desc_clause=desc_clause)
+def gpt_sections(item:str, desc:str|None)->dict:
+    clause = f"Include these user‑specified criteria: {desc}. " if desc else ""
+    prompt = USER_TMPL.format(item=item, desc_clause=clause)
     resp = openai.chat.completions.create(
         model=MODEL, temperature=TEMPERATURE,
-        messages=[{"role":"system","content":SYSTEM_PROMPT},
-                  {"role":"user","content":user_prompt}],
-        response_format={"type":"json_object"})
+        response_format={"type":"json_object"},
+        messages=[{"role":"system","content":SYSTEM},
+                  {"role":"user","content":prompt}]
+    )
     return json.loads(resp.choices[0].message.content)
 
-# ── 3. WORD HELPERS ─────────────────────────────────────────-
-def normalise(row:dict)->Tuple[str,str]:
-    low={k.lower():str(v) for k,v in row.items()}
-    return low.get("parameter",""), low.get("requirement","")
+# ── 3. DOCX helpers ────────────────────────────────────────
+def unbold_underline(par):
+    for run in par.runs:
+        run.font.bold      = False
+        run.font.underline = False
 
-def unbold(paragraph):
-    for run in paragraph.runs: run.font.bold=False
+def bullet(doc,text,ok):
+    p = doc.add_paragraph(text,style="List Bullet") if ok else doc.add_paragraph(f"• {text}")
+    unbold_underline(p)
 
-def add_bullet(doc:Document,text:str,style_ok:bool):
-    p = doc.add_paragraph(text, style="List Bullet") if style_ok else doc.add_paragraph(f"• {text}")
-    unbold(p)
+def box(cell):
+    tcPr = cell._tc.get_or_add_tcPr()
+    for old in tcPr.findall(qn("w:tcBorders")): tcPr.remove(old)
+    tcPr.append(parse_xml(
+        r'<w:tcBorders %s>'
+        r'<w:top w:val="single" w:sz="4" w:color="000000"/>'
+        r'<w:left w:val="single" w:sz="4" w:color="000000"/>'
+        r'<w:bottom w:val="single" w:sz="4" w:color="000000"/>'
+        r'<w:right w:val="single" w:sz="4" w:color="000000"/>'
+        r'</w:tcBorders>' % nsdecls('w')))
 
-def build_doc(header_tpl:pathlib.Path,sections:dict,name:str,cid:int,style_ok:bool)->pathlib.Path:
-    doc=Document(header_tpl)
-    title=doc.add_paragraph(f"RFQ for {name}")
+def build_doc(sec:dict,item:str,cid:int,bullet_ok:bool)->pathlib.Path:
+    doc=Document(TEMPLATE_HDR)
+    # Title
+    title=doc.add_paragraph(f"RFQ for {item}")
     title.alignment=WD_ALIGN_PARAGRAPH.CENTER
     title.style.font.size=Pt(16); title.style.font.bold=True
     doc.add_paragraph()
 
-    def heading(num,text): doc.add_heading(f"{num}. {text}", level=2)
+    def H(n,t):
+        h=doc.add_heading(f"{n}. {t}",level=2)
+        for r in h.runs: r.font.size=Pt(14); r.font.bold=True
 
-    heading(1,"Introduction"); unbold(doc.add_paragraph(sections.get("introduction","")))
-    heading(2,"Scope of Supply"); unbold(doc.add_paragraph(sections.get("scope","")))
+    # 1 Intro & 2 Scope
+    H(1,"Introduction"); unbold_underline(doc.add_paragraph(sec["introduction"]))
+    H(2,"Scope of Supply"); unbold_underline(doc.add_paragraph(sec["scope"]))
 
-    heading(3,"Technical Requirements")
-    table=doc.add_table(rows=1, cols=2); table.alignment=WD_TABLE_ALIGNMENT.CENTER
-    hdr=table.rows[0].cells; hdr[0].text="Parameter"; hdr[1].text="Requirement"
-    for c in hdr: c.paragraphs[0].runs[0].font.bold=True; c.vertical_alignment=WD_ALIGN_VERTICAL.CENTER
-    for r in sections.get("tech_table",[]): 
-        p,req=normalise(r); cells=table.add_row().cells; cells[0].text=p; cells[1].text=req
+    # 3 Technical Requirements
+    H(3,"Technical Requirements")
+    tbl=doc.add_table(rows=1,cols=2); tbl.alignment=WD_TABLE_ALIGNMENT.CENTER
+    hdr=tbl.rows[0].cells
+    hdr[0].text="Parameter"; hdr[1].text="Requirement"
+    for c in hdr:
+        r=c.paragraphs[0].runs[0]
+        r.font.bold=True; r.font.size=Pt(12)
+        box(c)
+    for row in sec["tech_table"]:
+        cells=tbl.add_row().cells
+        cells[0].text=row["parameter"]; cells[1].text=row["requirement"]
+        for c in cells:
+            r=c.paragraphs[0].runs[0]
+            r.font.size=Pt(11); r.font.bold=False; r.font.underline=False
+            box(c)
 
-    heading(4,"Commercial Requirements")
-    for b in sections.get("commercial_terms",[]): add_bullet(doc,b,style_ok)
+    # 4 Commercial & 5 Docs
+    H(4,"Commercial Requirements")
+    for b in sec["commercial_terms"]: bullet(doc,b,bullet_ok)
+    H(5,"Documentation Requirements")
+    for b in sec["docs_required"]:   bullet(doc,b,bullet_ok)
 
-    heading(5,"Documentation Requirements")
-    for b in sections.get("docs_required",[]): add_bullet(doc,b,style_ok)
-
-    heading(6,"Submission Guidelines")
-    unbold(doc.add_paragraph(
+    # 6 Submission
+    H(6,"Submission Guidelines")
+    unbold_underline(doc.add_paragraph(
         f"Please submit your quotations via email with the subject line:\n"
-        f"“Quotation for {name} - RESL”."))
-    add_bullet(doc,"Contact Person: P. Pranay Kiran, A. Sai Nithin",style_ok)
-    add_bullet(doc,"Email: Designengineer.pranay@resindia.co.in, engineer.resl1@resindia.co.in",style_ok)
+        f"“Quotation for {item} - RESL”."))
+    bullet(doc,"Contact Person: P. Pranay Kiran, A. Sai Nithin",bullet_ok)
+    bullet(doc,"Email: Designengineer.pranay@resindia.co.in, engineer.resl1@resindia.co.in",bullet_ok)
 
-    heading(7,"Confidentiality Clause")
-    unbold(doc.add_paragraph(
+    # 7 Confidentiality
+    H(7,"Confidentiality Clause")
+    unbold_underline(doc.add_paragraph(
         "All quotations and related documents submitted in response to this RFQ "
         "will be treated as confidential and used solely for evaluation purposes."))
 
-    out=OUT_DIR/f"RFQ_{cid:02d}_{name.replace(' ','_')}.docx"; doc.save(out); return out
+    out=OUT_DIR/f"RFQ_{cid:02d}_{item.replace(' ','_')}.docx"
+    doc.save(out); return out
 
-# bullet style availability
-try: Document(TEMPLATE_HDR).styles["List Bullet"]; STYLE_OK=True
-except KeyError: STYLE_OK=False; print("ℹ️  'List Bullet' style missing – plain bullets used.")
+# Bullet style availability
+try: Document(TEMPLATE_HDR).styles["List Bullet"]; BULLET_OK=True
+except KeyError: BULLET_OK=False; print("ℹ️  'List Bullet' style not found – plain bullets used.")
 
-# ── 4. MAIN LOOP ────────────────────────────────────────────
-generated=[]
-for rec in tqdm(df.to_dict(orient="records"),desc="RFQs"):
-    try:
-        sections=draft_sections(rec["Item"], rec.get("Description"))
-        generated.append(build_doc(TEMPLATE_HDR,sections,rec["Item"],int(rec["cid"]),STYLE_OK))
+# ── 4. Main loop ───────────────────────────────────────────
+created: List[pathlib.Path]=[]
+for rec in tqdm(df.to_dict(orient="records"),desc="Generating RFQs"):
+    try: sec=gpt_sections(rec["Item"], rec.get("Description"))
     except Exception as e:
-        print(f"⚠️  {rec['Item']} skipped: {e}")
+        print(f"\n⚠️  GPT error on '{rec['Item']}': {e}"); continue
+    if not sec:
+        print(f"\n⚠️  '{rec['Item']}' skipped: no JSON"); continue
+    try: created.append(build_doc(sec, rec["Item"], int(rec["cid"]), BULLET_OK))
+    except Exception as e:
+        print(f"\n⚠️  DOCX error on '{rec['Item']}': {e}")
 
-print(f"✓ Created {len(generated)} RFQ file(s) in {OUT_DIR.resolve()}")
+print(f"\n✓ Created {len(created)} RFQ file(s) in {OUT_DIR.resolve()}")
